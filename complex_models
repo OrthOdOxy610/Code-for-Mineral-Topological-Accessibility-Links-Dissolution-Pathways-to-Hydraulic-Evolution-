@@ -1,0 +1,166 @@
+import os
+import struct
+
+import matplotlib.pyplot as plt
+import numpy as np
+from scipy.ndimage import distance_transform_edt, gaussian_filter
+
+
+class MineralTopologyGenerator:
+    def __init__(self, input_file="lbm_input.dat"):
+        self.input_file = input_file
+        self.nx = self.ny = self.nz = 0
+        self.data = None
+        self.solid_mask = None
+        self.total_solid = 0
+        self.pct_qtz = 0.50
+        self.pct_dol = 0.15
+        self.pct_cal = 0.35
+        self.load_geometry()
+
+    def load_geometry(self):
+        try:
+            with open(self.input_file, "rb") as file:
+                self.nx, self.ny, self.nz = struct.unpack("iii", file.read(12))
+                raw = file.read(self.nx * self.ny * self.nz * 4)
+            self.data = np.frombuffer(raw, dtype=np.int32).reshape((self.ny, self.nx))
+        except FileNotFoundError:
+            print(f"Error: {self.input_file} not found. Using a 200x200 test grid.")
+            self.nx, self.ny, self.nz = 200, 200, 1
+            self.data = np.ones((self.ny, self.nx), dtype=np.int32)
+
+        self.solid_mask = self.data == 1
+        self.total_solid = np.sum(self.solid_mask)
+        print(f"Loaded: {self.nx}x{self.ny}, solid nodes: {self.total_solid}")
+
+    def _get_solid_coords(self):
+        return np.where(self.solid_mask)
+
+    def _apply_mineral_map(self, mineral_map):
+        new_data = self.data.copy()
+        new_data[self.solid_mask] = mineral_map[self.solid_mask]
+        return new_data
+
+    def _get_exact_counts(self):
+        n_qtz = int(self.total_solid * self.pct_qtz)
+        n_dol = int(self.total_solid * self.pct_dol)
+        n_cal = self.total_solid - n_qtz - n_dol
+        return n_qtz, n_dol, n_cal
+
+    def generate_homogeneous(self, scale=3.0):
+        print("Generating case1")
+        n_qtz, n_dol, n_cal = self._get_exact_counts()
+        feature_field = gaussian_filter(np.random.normal(0, 1, (self.ny, self.nx)), sigma=scale)
+        solid_indices = self._get_solid_coords()
+        sorted_idx = np.argsort(feature_field[solid_indices])
+        mineral_map = np.zeros_like(self.data)
+
+        qtz_idx = sorted_idx[:n_qtz]
+        reactive_idx = sorted_idx[n_qtz:]
+        mineral_map[solid_indices[0][qtz_idx], solid_indices[1][qtz_idx]] = 4
+
+        reactive_minerals = np.array([3] * n_dol + [2] * n_cal)
+        np.random.shuffle(reactive_minerals)
+        mineral_map[solid_indices[0][reactive_idx], solid_indices[1][reactive_idx]] = reactive_minerals
+        return self._apply_mineral_map(mineral_map)
+
+    def generate_layered(self, angle=0, scale=35.0):
+        print(f"Generating layered case at {angle} degrees")
+        n_qtz, n_dol, _ = self._get_exact_counts()
+        y, x = np.indices((self.ny, self.nx))
+        theta = np.radians(angle)
+        feature_field = np.sin(2 * np.pi * (x * np.cos(theta) + y * np.sin(theta)) / scale)
+        solid_indices = self._get_solid_coords()
+        sorted_idx = np.argsort(feature_field[solid_indices])
+        mineral_map = np.zeros_like(self.data)
+
+        qtz_idx = sorted_idx[:n_qtz]
+        dol_idx = sorted_idx[n_qtz:n_qtz + n_dol]
+        cal_idx = sorted_idx[n_qtz + n_dol:]
+        mineral_map[solid_indices[0][qtz_idx], solid_indices[1][qtz_idx]] = 4
+        mineral_map[solid_indices[0][dol_idx], solid_indices[1][dol_idx]] = 3
+        mineral_map[solid_indices[0][cal_idx], solid_indices[1][cal_idx]] = 2
+        return self._apply_mineral_map(mineral_map)
+
+    def generate_replacement(self, scale=10.0):
+        print("Generating case4")
+        n_qtz, n_dol, _ = self._get_exact_counts()
+        qtz_field = gaussian_filter(np.random.normal(0, 1, (self.ny, self.nx)), sigma=scale)
+        solid_indices = self._get_solid_coords()
+        sorted_qtz_idx = np.argsort(qtz_field[solid_indices])
+        mineral_map = np.zeros_like(self.data)
+
+        qtz_idx = sorted_qtz_idx[:n_qtz]
+        qtz_y, qtz_x = solid_indices[0][qtz_idx], solid_indices[1][qtz_idx]
+        mineral_map[qtz_y, qtz_x] = 4
+
+        carb_idx = sorted_qtz_idx[n_qtz:]
+        carb_y, carb_x = solid_indices[0][carb_idx], solid_indices[1][carb_idx]
+        carb_mask = np.zeros((self.ny, self.nx), dtype=bool)
+        carb_mask[carb_y, carb_x] = True
+        effective_dists = distance_transform_edt(carb_mask)[carb_y, carb_x]
+        effective_dists += np.random.normal(0, 0.2, len(effective_dists))
+        sorted_carb_idx = np.argsort(effective_dists)
+
+        dol_idx = sorted_carb_idx[:n_dol]
+        cal_idx = sorted_carb_idx[n_dol:]
+        mineral_map[carb_y[dol_idx], carb_x[dol_idx]] = 3
+        mineral_map[carb_y[cal_idx], carb_x[cal_idx]] = 2
+        return self._apply_mineral_map(mineral_map)
+
+    def generate_fracture(self):
+        print("Generating case5")
+        n_qtz, n_dol, n_cal = self._get_exact_counts()
+        fracture_skeleton = np.ones((self.ny, self.nx), dtype=bool)
+        x_coords = np.arange(self.nx)
+
+        for _ in range(np.random.randint(3, 6)):
+            y_start = np.random.uniform(0.1 * self.ny, 0.9 * self.ny)
+            y_end = np.random.uniform(0.1 * self.ny, 0.9 * self.ny)
+            y_curve = np.linspace(y_start, y_end, self.nx)
+            y_curve += gaussian_filter(np.random.normal(0, 1, self.nx), sigma=self.nx / 10) * (self.ny / 8)
+            y_curve += gaussian_filter(np.random.normal(0, 1, self.nx), sigma=self.nx / 50) * (self.ny / 25)
+            y_curve = np.clip(y_curve, 0, self.ny - 1).astype(int)
+            fracture_skeleton[y_curve, x_coords] = False
+            fracture_skeleton[np.clip(y_curve - 1, 0, self.ny - 1), x_coords] = False
+            fracture_skeleton[np.clip(y_curve + 1, 0, self.ny - 1), x_coords] = False
+
+        solid_indices = self._get_solid_coords()
+        sorted_idx = np.argsort(distance_transform_edt(fracture_skeleton)[solid_indices])
+        mineral_map = np.zeros_like(self.data)
+        cal_idx = sorted_idx[:n_cal]
+        dol_idx = sorted_idx[n_cal:n_cal + n_dol]
+        qtz_idx = sorted_idx[n_cal + n_dol:]
+        mineral_map[solid_indices[0][cal_idx], solid_indices[1][cal_idx]] = 2
+        mineral_map[solid_indices[0][dol_idx], solid_indices[1][dol_idx]] = 3
+        mineral_map[solid_indices[0][qtz_idx], solid_indices[1][qtz_idx]] = 4
+        return self._apply_mineral_map(mineral_map)
+
+    def save_output(self, new_data, base_name):
+        with open(f"{base_name}.dat", "wb") as file:
+            file.write(struct.pack("iii", self.nx, self.ny, self.nz))
+            file.write(new_data.astype(np.int32).tobytes())
+
+        image = np.zeros((*new_data.shape, 3), dtype=np.uint8)
+        image[new_data == 0] = [255, 255, 255]
+        image[new_data == 2] = [255, 0, 0]
+        image[new_data == 3] = [0, 255, 0]
+        image[new_data == 4] = [128, 128, 128]
+        plt.imsave(f"{base_name}.jpg", np.flipud(image))
+        print(f"Saved: {base_name}.dat and {base_name}.jpg")
+
+
+if __name__ == "__main__":
+    output_dir = "simulation_cases"
+    os.makedirs(output_dir, exist_ok=True)
+    generator = MineralTopologyGenerator("lbm_input.dat")
+
+    cases = {
+        "case1": generator.generate_homogeneous(),
+        "case2": generator.generate_layered(angle=0),
+        "case3": generator.generate_layered(angle=90),
+        "case4": generator.generate_replacement(),
+        "case5": generator.generate_fracture(),
+    }
+    for name, mineral_map in cases.items():
+        generator.save_output(mineral_map, os.path.join(output_dir, name))
